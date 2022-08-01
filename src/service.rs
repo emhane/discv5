@@ -881,22 +881,64 @@ impl Service {
             bucket_filter,
         );
 
-        debug!("Adding {} entries from local routing table to topic's kbuckets", self.kbuckets.write().iter().count());
+        debug!(
+            "Adding {} entries from local routing table to topic's kbuckets",
+            self.kbuckets.write().iter().count()
+        );
 
         for entry in self.kbuckets.write().iter() {
-            match kbuckets.insert_or_update(entry.node.key, EnrBankEntry{ enr: Arc::new(RwLock::new(entry.node.value.clone())) }, entry.status) {
-                InsertResult::Inserted
-                | InsertResult::Pending { .. }
-                | InsertResult::StatusUpdated { .. }
-                | InsertResult::ValueUpdated
-                | InsertResult::Updated { .. }
-                | InsertResult::UpdatedPending => trace!(
-                    "Added node id {} to kbucket of topic hash {}",
-                    entry.node.value.node_id(),
-                    topic_hash
-                ),
-                InsertResult::Failed(f) => error!("Failed to insert ENR for topic hash {}. Failure reason: {:?}", topic_hash, f),
-            }
+            match self.enr_bank.enr_bank.entry(*entry.node.key.preimage()) {
+                Entry::Vacant(new_entry) => {
+                    let new_mut_entry = new_entry.insert(EnrBankEntryAndStatus {
+                        enr: EnrBankEntry {
+                            enr: Arc::new(RwLock::new(entry.node.value.clone())),
+                        },
+                        status: Arc::new(RwLock::new(entry.status)),
+                    });
+                    match kbuckets.insert_or_update(
+                        entry.node.key,
+                        new_mut_entry.enr.clone(),
+                        entry.status,
+                    ) {
+                        InsertResult::Inserted
+                        | InsertResult::Pending { .. }
+                        | InsertResult::StatusUpdated { .. }
+                        | InsertResult::ValueUpdated
+                        | InsertResult::Updated { .. }
+                        | InsertResult::UpdatedPending => trace!(
+                            "Added node id {} to kbucket of topic hash {}",
+                            entry.node.value.node_id(),
+                            topic_hash
+                        ),
+                        InsertResult::Failed(f) => error!(
+                            "Failed to insert ENR for topic hash {}. Failure reason: {:?}",
+                            topic_hash, f
+                        ),
+                    }
+                }
+                Entry::Occupied(mut enr_bank_entry) => {
+                    match kbuckets.insert_or_update(
+                        entry.node.key,
+                        enr_bank_entry.get_mut().enr.clone(),
+                        entry.status,
+                    ) {
+                        InsertResult::Inserted
+                        | InsertResult::Pending { .. }
+                        | InsertResult::StatusUpdated { .. }
+                        | InsertResult::ValueUpdated
+                        | InsertResult::Updated { .. }
+                        | InsertResult::UpdatedPending => trace!(
+                            "Added node id {} to kbucket of topic hash {}",
+                            entry.node.value.node_id(),
+                            topic_hash
+                        ),
+                        InsertResult::Failed(f) => error!(
+                            "Failed to insert ENR for topic hash {}. Failure reason: {:?}",
+                            topic_hash, f
+                        ),
+                    }
+                }
+            };
         }
 
         /*debug!(
@@ -1018,16 +1060,14 @@ impl Service {
                     // Otherwise get the enr from the storage for uncontacted peers discovered by find node
                     // queries for topics.
                     } else if let Some(enr) = self.discovered_enrs.remove(&node_id) {
-                        if let Ok(node_contact) = NodeContact::try_from_enr(
-                            enr,
-                            self.config.ip_mode,
-                        )
-                        .map_err(|e| {
-                            error!(
+                        if let Ok(node_contact) =
+                            NodeContact::try_from_enr(enr, self.config.ip_mode).map_err(|e| {
+                                error!(
                                 "Enr of node id {} is uncontactable. Discarding peer. Error: {:?}",
                                 node_id, e
                             )
-                        }) {
+                            })
+                        {
                             new_reg_contacts.push(node_contact);
                         }
                     }
