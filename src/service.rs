@@ -881,10 +881,10 @@ impl Service {
             bucket_filter,
         );
 
-        //debug!("Adding {} entries from local routing table to topic's kbuckets", self.kbuckets.write().iter().count());
+        debug!("Adding {} entries from local routing table to topic's kbuckets", self.kbuckets.write().iter().count());
 
-        /*for entry in self.kbuckets.write().iter() {
-            match kbuckets.insert_or_update(entry.node.key, entry.node.value.clone(), entry.status) {
+        for entry in self.kbuckets.write().iter() {
+            match kbuckets.insert_or_update(entry.node.key, EnrBankEntry{ enr: Arc::new(RwLock::new(entry.node.value.clone())) }, entry.status) {
                 InsertResult::Inserted
                 | InsertResult::Pending { .. }
                 | InsertResult::StatusUpdated { .. }
@@ -897,9 +897,9 @@ impl Service {
                 ),
                 InsertResult::Failed(f) => error!("Failed to insert ENR for topic hash {}. Failure reason: {:?}", topic_hash, f),
             }
-        }*/
+        }
 
-        debug!(
+        /*debug!(
             "Adding {} entries from enr bank to topic's kbuckets",
             self.enr_bank.enr_bank.len()
         );
@@ -926,7 +926,7 @@ impl Service {
                     topic_hash, f
                 ),
             }
-        }
+        }*/
         self.topics_kbuckets.insert(topic_hash, kbuckets);
     }
 
