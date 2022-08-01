@@ -27,7 +27,7 @@ use crate::{
     handler::{Handler, HandlerIn, HandlerOut},
     kbucket::{
         self, ConnectionDirection, ConnectionState, FailureReason, InsertResult, KBucketsTable,
-        NodeStatus, UpdateResult,
+        Node, NodeStatus, UpdateResult,
     },
     metrics::METRICS,
     node_info::{NodeAddress, NodeContact, NonContactable},
@@ -50,7 +50,7 @@ use parking_lot::RwLock;
 use rlp::{Rlp, RlpStream};
 use rpc::*;
 use std::{
-    collections::{hash_map::Entry, BTreeMap, HashMap},
+    collections::{hash_map::Entry, BTreeMap, HashMap, HashSet},
     io::Error,
     net::SocketAddr,
     pin::Pin,
@@ -71,13 +71,13 @@ pub(crate) const DISTANCES_TO_REQUEST_PER_PEER: usize = 3;
 
 /// The number of registration attempts that should be active per distance
 /// if there are sufficient peers.
-const MAX_REG_ATTEMPTS_DISTANCE: usize = 16;
+const MAX_REG_ATTEMPTS_PER_DISTANCE: usize = 16;
 
 /// Registration of topics are paced to occur at intervals t avoid a self-provoked DoS.
 const REGISTER_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Registration attempts must be limited per registration interval.
-const MAX_REGTOPICS_REGISTER_INTERVAL: usize = 16;
+const MAX_REGTOPICS_IN_REGISTER_INTERVAL: usize = 16;
 
 /// The max number of uncontacted peers to store before the kbuckets per topic.
 const MAX_UNCONTACTED_PEERS_TOPIC_BUCKET: usize = 16;
@@ -209,6 +209,47 @@ pub enum ServiceRequest {
     ),
 }
 
+pub struct EnrBankEntryAndStatus {
+    enr: EnrBankEntry,
+    status: Arc<RwLock<NodeStatus>>,
+}
+
+#[derive(Clone)]
+pub struct EnrBankEntry {
+    enr: Arc<RwLock<Enr>>,
+}
+
+impl EnrBankEntry {
+    fn enr(&self) -> Enr {
+        self.enr.read().clone()
+    }
+}
+
+impl PartialEq for EnrBankEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.enr.read().seq() == other.enr.read().seq()
+            && self.enr.read().node_id() == other.enr.read().node_id()
+            && self.enr.read().signature() == other.enr.read().signature()
+    }
+}
+
+impl Eq for EnrBankEntry {}
+
+/// The latest version of enrs of peers and the connections status to the peer, is shared among
+/// topic's kbucktes and stored in the [`EnrBank`].
+#[derive(Default)]
+pub struct EnrBank {
+    enr_bank: HashMap<NodeId, EnrBankEntryAndStatus>,
+}
+
+impl EnrBank {
+    /// Finds the enr in the enr bank. If the node has been contactable it will be in the enr
+    /// bank.
+    fn find_enr(&self, node_id: &NodeId) -> Option<&EnrBankEntryAndStatus> {
+        self.enr_bank.get(node_id)
+    }
+}
+
 pub struct Service {
     /// Configuration parameters.
     config: Discv5Config,
@@ -269,12 +310,15 @@ pub struct Service {
     registration_attempts: HashMap<TopicHash, BTreeMap<u64, RegAttempts>>,
 
     /// KBuckets per topic hash.
-    topics_kbuckets: HashMap<TopicHash, KBucketsTable<NodeId, Enr>>,
+    topics_kbuckets: HashMap<TopicHash, KBucketsTable<NodeId, EnrBankEntry>>,
 
     /// The peers returned in a NODES response to a TOPICQUERY or REGTOPIC request are inserted in
     /// this intermediary stroage to check their connectivity before inserting them in the topic's
     /// kbuckets.
-    discovered_peers_topic: HashMap<TopicHash, BTreeMap<u64, HashMap<NodeId, Enr>>>,
+    discovered_enrs: HashMap<NodeId, Enr>,
+
+    /// Uncontacted peers are sorted by topic hash.
+    discovered_peers_topic: HashMap<TopicHash, BTreeMap<u64, HashSet<NodeId>>>,
 
     /// The key used for en-/decrypting tickets.
     ticket_key: [u8; 16],
@@ -284,6 +328,10 @@ pub struct Service {
 
     /// Locally initiated topic query requests in process.
     active_topic_queries: ActiveTopicQueries,
+
+    /// The bank of enrs used in the local routing table and topics kbuckets, and the current
+    /// connection status to them.
+    enr_bank: EnrBank,
 }
 
 /// The state of a topic lookup which changes as responses to sent TOPICQUERYs are received.
@@ -484,6 +532,7 @@ impl Service {
                     ads: Ads::default(),
                     registration_attempts: HashMap::new(),
                     topics_kbuckets: HashMap::new(),
+                    discovered_enrs: Default::default(),
                     discovered_peers_topic: HashMap::new(),
                     ticket_key: rand::random(),
                     tickets: Tickets::default(),
@@ -491,6 +540,7 @@ impl Service {
                         config.topic_query_timeout,
                         config.max_nodes_response,
                     ),
+                    enr_bank: Default::default(),
                     exit,
                     config: config.clone(),
                 };
@@ -553,47 +603,8 @@ impl Service {
                         ServiceRequest::TopicQuery(topic_hash, callback) => {
                             // If we look up the topic hash for the first time we initialise its kbuckets.
                             if let Entry::Vacant(_) = self.topics_kbuckets.entry(topic_hash) {
-                                // NOTE: Currently we don't expose custom filter support in the configuration. Users can
-                                // optionally use the IP filter via the ip_limit configuration parameter. In the future, we
-                                // may expose this functionality to the users if there is demand for it.
-                                let (table_filter, bucket_filter) = if self.config.ip_limit {
-                                    (
-                                        Some(Box::new(kbucket::IpTableFilter) as Box<dyn kbucket::Filter<Enr>>),
-                                        Some(Box::new(kbucket::IpBucketFilter) as Box<dyn kbucket::Filter<Enr>>),
-                                    )
-                                } else {
-                                    (None, None)
-                                };
-
-                                trace!("Initiating kbuckets for topic hash {}", topic_hash);
-                                let mut kbuckets = KBucketsTable::new(
-                                    NodeId::new(&topic_hash.as_bytes()).into(),
-                                    Duration::from_secs(60),
-                                    self.config.incoming_bucket_limit,
-                                    table_filter,
-                                    bucket_filter,
-                                );
-
-                                debug!("Adding {} entries from local routing table to topic's kbuckets", self.kbuckets.write().iter().count());
-
-                                for entry in self.kbuckets.write().iter() {
-                                    match kbuckets.insert_or_update(entry.node.key, entry.node.value.clone(), entry.status) {
-                                        InsertResult::Inserted
-                                        | InsertResult::Pending { .. }
-                                        | InsertResult::StatusUpdated { .. }
-                                        | InsertResult::ValueUpdated
-                                        | InsertResult::Updated { .. }
-                                        | InsertResult::UpdatedPending => trace!(
-                                            "Added node id {} to kbucket of topic hash {}",
-                                            entry.node.value.node_id(),
-                                            topic_hash
-                                        ),
-                                        InsertResult::Failed(f) => error!("Failed to insert ENR for topic hash {}. Failure reason: {:?}", topic_hash, f),
-                                    }
-                                }
-                                self.topics_kbuckets.insert(topic_hash, kbuckets);
+                                self.init_topic_kbuckets(topic_hash);
                             }
-
                             // To fill the kbuckets closest to the topic hash as well as those further away
                             // (itertively getting closer to node ids to the topic hash) start a find node
                             // query searching for the topic hash's bytes wrapped in a NodeId.
@@ -633,45 +644,9 @@ impl Service {
                                     .write()
                                     .insert("topics", &topics_field, &self.enr_key.write())
                                     .map_err(|e| error!("Failed to insert field 'topics' into local enr. Error {:?}", e)).is_ok() {
-                                    // NOTE: Currently we don't expose custom filter support in the configuration. Users can
-                                    // optionally use the IP filter via the ip_limit configuration parameter. In the future, we
-                                    // may expose this functionality to the users if there is demand for it.
-                                    let (table_filter, bucket_filter) = if self.config.ip_limit {
-                                        (
-                                            Some(Box::new(kbucket::IpTableFilter) as Box<dyn kbucket::Filter<Enr>>),
-                                            Some(Box::new(kbucket::IpBucketFilter) as Box<dyn kbucket::Filter<Enr>>),
-                                        )
-                                    } else {
-                                        (None, None)
-                                    };
 
-                                    trace!("Initiating kbuckets for topic hash {}", topic_hash);
-                                    let mut kbuckets = KBucketsTable::new(
-                                        NodeId::new(&topic_hash.as_bytes()).into(),
-                                        Duration::from_secs(60),
-                                        self.config.incoming_bucket_limit,
-                                        table_filter,
-                                        bucket_filter,
-                                    );
+                                    self.init_topic_kbuckets(topic_hash);
 
-                                    debug!("Adding {} entries from local routing table to topic's kbuckets", self.kbuckets.write().iter().count());
-
-                                    for entry in self.kbuckets.write().iter() {
-                                        match kbuckets.insert_or_update(entry.node.key, entry.node.value.clone(), entry.status) {
-                                            InsertResult::Inserted
-                                            | InsertResult::Pending { .. }
-                                            | InsertResult::StatusUpdated { .. }
-                                            | InsertResult::ValueUpdated
-                                            | InsertResult::Updated { .. }
-                                            | InsertResult::UpdatedPending => trace!(
-                                                "Added node id {} to kbucket of topic hash {}",
-                                                entry.node.value.node_id(),
-                                                topic_hash
-                                            ),
-                                            InsertResult::Failed(f) => error!("Failed to insert ENR for topic hash {}. Failure reason: {:?}", topic_hash, f),
-                                        }
-                                    }
-                                    self.topics_kbuckets.insert(topic_hash, kbuckets);
                                     METRICS.topics_to_publish.store(self.registration_attempts.len(), Ordering::Relaxed);
 
                                     // To fill the kbuckets closest to the topic hash as well as those further away
@@ -871,7 +846,7 @@ impl Service {
                     while let Some(topic_hash) = topic_item {
                         trace!("Republishing topic hash {}", topic_hash);
                         sent_regtopics += self.send_register_topics(topic_hash);
-                        if sent_regtopics >= MAX_REGTOPICS_REGISTER_INTERVAL {
+                        if sent_regtopics >= MAX_REGTOPICS_IN_REGISTER_INTERVAL {
                             break
                         }
                         topic_item = topics_to_reg_iter.next();
@@ -884,6 +859,77 @@ impl Service {
         }
     }
 
+    fn init_topic_kbuckets(&mut self, topic_hash: TopicHash) {
+        // NOTE: Currently we don't expose custom filter support in the configuration. Users can
+        // optionally use the IP filter via the ip_limit configuration parameter. In the future, we
+        // may expose this functionality to the users if there is demand for it.
+        let (table_filter, bucket_filter) = /*if self.config.ip_limit {
+            (
+                Some(Box::new(kbucket::IpTableFilter) as Box<dyn kbucket::Filter<EnrBankEntry>>),
+                Some(Box::new(kbucket::IpBucketFilter) as Box<dyn kbucket::Filter<EnrBankEntry>>),
+            )
+        } else */{
+            (None, None)
+        };
+
+        trace!("Initiating kbuckets for topic hash {}", topic_hash);
+        let mut kbuckets = KBucketsTable::<NodeId, EnrBankEntry>::new(
+            NodeId::new(&topic_hash.as_bytes()).into(),
+            Duration::from_secs(60),
+            self.config.incoming_bucket_limit,
+            table_filter,
+            bucket_filter,
+        );
+
+        //debug!("Adding {} entries from local routing table to topic's kbuckets", self.kbuckets.write().iter().count());
+
+        /*for entry in self.kbuckets.write().iter() {
+            match kbuckets.insert_or_update(entry.node.key, entry.node.value.clone(), entry.status) {
+                InsertResult::Inserted
+                | InsertResult::Pending { .. }
+                | InsertResult::StatusUpdated { .. }
+                | InsertResult::ValueUpdated
+                | InsertResult::Updated { .. }
+                | InsertResult::UpdatedPending => trace!(
+                    "Added node id {} to kbucket of topic hash {}",
+                    entry.node.value.node_id(),
+                    topic_hash
+                ),
+                InsertResult::Failed(f) => error!("Failed to insert ENR for topic hash {}. Failure reason: {:?}", topic_hash, f),
+            }
+        }*/
+
+        debug!(
+            "Adding {} entries from enr bank to topic's kbuckets",
+            self.enr_bank.enr_bank.len()
+        );
+
+        for (node_id, enr_and_status) in self.enr_bank.enr_bank.iter() {
+            let key = kbucket::Key::from(*node_id);
+            match kbuckets.insert_or_update(
+                &key,
+                enr_and_status.enr.clone(),
+                *enr_and_status.status.read(),
+            ) {
+                InsertResult::Inserted
+                | InsertResult::Pending { .. }
+                | InsertResult::StatusUpdated { .. }
+                | InsertResult::ValueUpdated
+                | InsertResult::Updated { .. }
+                | InsertResult::UpdatedPending => trace!(
+                    "Added node id {} to kbucket of topic hash {}",
+                    node_id,
+                    topic_hash
+                ),
+                InsertResult::Failed(f) => error!(
+                    "Failed to insert ENR for topic hash {}. Failure reason: {:?}",
+                    topic_hash, f
+                ),
+            }
+        }
+        self.topics_kbuckets.insert(topic_hash, kbuckets);
+    }
+
     /// Internal function that starts a topic registration. This function should not be called outside of [`REGISTER_INTERVAL`].
     fn send_register_topics(&mut self, topic_hash: TopicHash) -> usize {
         trace!("Sending REGTOPICS");
@@ -894,12 +940,12 @@ impl Service {
                 topic_hash
             );
             let reg_attempts = self.registration_attempts.entry(topic_hash).or_default();
-            let mut new_peers = Vec::new();
+            let mut new_reg_contacts = Vec::new();
 
             // Ensure that max_reg_attempts_bucket registration attempts are alive per bucket if that many peers are
             // available at that distance.
-            for (index, bucket) in kbuckets.get_mut().buckets_iter().enumerate() {
-                if new_peers.len() >= MAX_REGTOPICS_REGISTER_INTERVAL {
+            for (index, bucket) in kbuckets.get_mut().buckets_iter_mut().enumerate() {
+                if new_reg_contacts.len() >= MAX_REGTOPICS_IN_REGISTER_INTERVAL {
                     break;
                 }
                 let distance = index as u64 + 1;
@@ -928,36 +974,77 @@ impl Service {
                         }
                     });
 
-                let mut new_peers_bucket = Vec::new();
+                let mut new_uncontacted_peers_by_bucket = Vec::new();
 
-                // Attempt sending a request to uncontacted peers if any.
+                // Attempt making registration attempts for uncontacted peers first.
                 if let Some(peers) = self.discovered_peers_topic.get_mut(&topic_hash) {
                     if let Some(bucket) = peers.get_mut(&distance) {
-                        bucket.retain(|node_id, enr | {
-                            if new_peers_bucket.len() + active_reg_attempts_bucket >= MAX_REG_ATTEMPTS_DISTANCE {
+                        bucket.retain(|node_id | {
+                            if new_uncontacted_peers_by_bucket.len() + active_reg_attempts_bucket >= MAX_REG_ATTEMPTS_PER_DISTANCE {
                                 true
                             } else if let Entry::Vacant(_) = registrations.reg_attempts.entry(*node_id) {
                                 debug!("Found new registration peer in uncontacted peers for topic {}. Peer: {:?}", topic_hash, node_id);
                                 registrations.reg_attempts.insert(*node_id, RegistrationState::Ticket);
-                                new_peers_bucket.push(enr.clone());
+                                new_uncontacted_peers_by_bucket.push(*node_id);
                                 false
                             } else {
                                 true
                             }
                         });
-                        new_peers.append(&mut new_peers_bucket);
                     }
                 }
 
-                // The count of active registration attempts for a distance after expired ads have been
+                // Get the contact of the new peers to this bucket of the topic's kbuckets.
+                for node_id in new_uncontacted_peers_by_bucket {
+                    // If any other node has queried this node already, the latest version of the enr and
+                    // connection status will be in the enr bank. Get the node contact for the latest
+                    // version of the enr.
+                    if let Some(entry) = self.enr_bank.find_enr(&node_id) {
+                        let enr = entry.enr.enr();
+                        if let Ok(node_contact) = NodeContact::try_from_enr(enr, self.config.ip_mode)
+                        .map_err(|e| debug_unreachable!("Nodes in the enr bank have already been contacted and should hence be transformable into a NodeContact. Error: {:?}", e))
+                        {
+                            new_reg_contacts.push(node_contact);
+                            // Link the enr form the bank to the topic's kbuckets and insert it with the latest
+                            // connection status.
+                            let key = kbucket::Key::from(node_id);
+                            trace!("Inserting new peer {} into kbuckets of topic hash {}", node_id, topic_hash);
+                            let _ = bucket.insert(Node {
+                                key,
+                                value: entry.enr.clone(),
+                                status: *entry.status.read(),
+                            });
+                        }
+                    // Otherwise get the enr from the storage for uncontacted peers discovered by find node
+                    // queries for topics.
+                    } else if let Some(enr) = self.discovered_enrs.remove(&node_id) {
+                        if let Ok(node_contact) = NodeContact::try_from_enr(
+                            enr,
+                            self.config.ip_mode,
+                        )
+                        .map_err(|e| {
+                            error!(
+                                "Enr of node id {} is uncontactable. Discarding peer. Error: {:?}",
+                                node_id, e
+                            )
+                        }) {
+                            new_reg_contacts.push(node_contact);
+                        }
+                    }
+                }
+
+                let mut new_peers_by_bucket: usize = 0;
+
+                // If the count of active registration attempts for a distance after expired ads have been
                 // removed is less than the max number of registration attempts that should be active
-                // per bucket and is not equal to the total number of peers available in that bucket.
-                if active_reg_attempts_bucket < MAX_REG_ATTEMPTS_DISTANCE
+                // per bucket and is not equal to the total number of peers available in that bucket, query
+                // more peers.
+                if active_reg_attempts_bucket < MAX_REG_ATTEMPTS_PER_DISTANCE
                     && registrations.reg_attempts.len() != bucket.num_entries()
                 {
                     for peer in bucket.iter() {
-                        if new_peers_bucket.len() + active_reg_attempts_bucket
-                            >= MAX_REG_ATTEMPTS_DISTANCE
+                        if new_peers_by_bucket + active_reg_attempts_bucket
+                            >= MAX_REG_ATTEMPTS_PER_DISTANCE
                         {
                             break;
                         }
@@ -971,23 +1058,30 @@ impl Service {
                             registrations
                                 .reg_attempts
                                 .insert(node_id, RegistrationState::Ticket);
-                            new_peers_bucket.push(peer.value.clone())
+                            new_peers_by_bucket += 1;
+                        }
+                        if let Ok(node_contact) =
+                            NodeContact::try_from_enr(peer.value.enr(), self.config.ip_mode)
+                                .map_err(|e| {
+                                    error!(
+                                "Enr of node id {} is uncontactable. Discarding peer. Error: {:?}",
+                                node_id, e
+                            )
+                                })
+                        {
+                            new_reg_contacts.push(node_contact);
                         }
                     }
-                    new_peers.append(&mut new_peers_bucket);
                 }
             }
+
             let mut sent_regtopics = 0;
 
-            for peer in new_peers {
+            for node_contact in new_reg_contacts {
                 let local_enr = self.local_enr.read().clone();
-                if let Ok(node_contact) = NodeContact::try_from_enr(peer, self.config.ip_mode)
-                    .map_err(|e| error!("Failed to send REGTOPIC to peer. Error: {:?}", e))
-                {
-                    self.reg_topic_request(node_contact, topic_hash, local_enr.clone(), None);
-                    // If an uncontacted peer has a faulty enr, don't count the registration attempt.
-                    sent_regtopics += 1;
-                }
+                self.reg_topic_request(node_contact, topic_hash, local_enr.clone(), None);
+                // If an uncontacted peer has a faulty enr, don't count the registration attempt.
+                sent_regtopics += 1;
             }
             sent_regtopics
         } else {
@@ -1017,22 +1111,22 @@ impl Service {
         // Attempt to query max_topic_query_peers peers at a time. Possibly some peers will return more than one result
         // (ADNODES of length > 1), or no results will be returned from that peer.
         let max_topic_query_peers = self.config.max_nodes_response;
+        let mut new_query_contacts = Vec::new();
+        let mut new_uncontacted_peers_by_bucket = Vec::new();
 
-        let mut new_query_peers: Vec<Enr> = Vec::new();
-
-        // Attempt sending a request to uncontacted peers if any.
+        // Attempt sending a request to uncontacted peers first if any.
         if let Some(peers) = self.discovered_peers_topic.get_mut(&topic_hash) {
-            // Prefer querying nodes further away, i.e. in buckets of further distance to topic, to avoid hotspots.
+            // Prefer querying uncontacted nodes further away, i.e. in buckets of further distance to topic, to avoid hotspots.
             for bucket in peers.values_mut().rev() {
-                if new_query_peers.len() < max_topic_query_peers {
+                if new_query_contacts.len() < max_topic_query_peers {
                     break;
                 }
-                bucket.retain(|node_id, enr| {
-                    if new_query_peers.len() >= max_topic_query_peers {
+                bucket.retain(|node_id| {
+                    if new_query_contacts.len() >= max_topic_query_peers {
                         true
                     } else if let Entry::Vacant(entry) = query.queried_peers.entry(*node_id) {
                         entry.insert(false);
-                        new_query_peers.push(enr.clone());
+                        new_uncontacted_peers_by_bucket.push(*node_id);
                         trace!(
                             "Found a new topic query peer {} in uncontacted peers of topic hash {}",
                             node_id,
@@ -1047,27 +1141,65 @@ impl Service {
         }
 
         if let Some(kbuckets) = self.topics_kbuckets.get_mut(&topic_hash) {
+            // Link the peer that may or may not have been contacted, but has at least never been contacted
+            // in regards to this topic before.
+            for node_id in new_uncontacted_peers_by_bucket {
+                // If any other node has queried this node already, the enr and connection status will be in
+                // the enr bank and the enr may be an updated version. Get the node contact for the latest
+                // version of the enr.
+                if let Some(entry) = self.enr_bank.find_enr(&node_id) {
+                    // Link the enr form the bank to the topic's kbuckets
+                    let key = kbucket::Key::from(node_id);
+                    let _ =
+                        kbuckets.insert_or_update(&key, entry.enr.clone(), *entry.status.read());
+                    let enr = entry.enr.enr();
+                    if let Ok(node_contact) = NodeContact::try_from_enr(enr, self.config.ip_mode)
+                            .map_err(|e| debug_unreachable!("Nodes in the enr bank have already been contacted and should hence be transformable into a NodeContact. Error: {:?}", e))
+                            {
+                                new_query_contacts.push(node_contact);
+                            }
+                // Otherwise get the enr from the storage for uncontacted peers discovered by find node
+                // queries for topics.
+                } else if let Some(enr) = self.discovered_enrs.remove(&node_id) {
+                    if let Ok(node_contact) = NodeContact::try_from_enr(enr, self.config.ip_mode)
+                        .map_err(|e| {
+                            error!(
+                                "Enr of node id {} is uncontactable. Discarding peer. Error: {:?}",
+                                node_id, e
+                            )
+                        })
+                    {
+                        new_query_contacts.push(node_contact);
+                    }
+                }
+            }
+            // If max_topic_query_peers hasn't been reached query peers that have already been contacted in regards
+            // to this topic.
             // Prefer querying nodes further away, i.e. in buckets of further distance to topic, to avoid hotspots.
             for kbuckets_entry in kbuckets.iter().rev() {
-                if new_query_peers.len() >= max_topic_query_peers {
+                if new_query_contacts.len() >= max_topic_query_peers {
                     break;
                 }
                 let node_id = *kbuckets_entry.node.key.preimage();
-                let enr = kbuckets_entry.node.value;
+                let enr_bank_entry = kbuckets_entry.node.value;
 
                 if let Entry::Vacant(entry) = query.queried_peers.entry(node_id) {
                     entry.insert(false);
-                    new_query_peers.push(enr.clone());
-                    trace!(
-                        "Found a new topic query peer {} in kbuckets of topic hash {}",
-                        node_id,
-                        topic_hash
-                    );
+                    if let Ok(node_contact) = NodeContact::try_from_enr(enr_bank_entry.enr(), self.config.ip_mode)
+                    .map_err(|e| debug_unreachable!("Nodes in the topic's kbuckets bank have already been contacted and should hence be transformable into a NodeContact. Error: {:?}", e))
+                    {
+                        trace!(
+                            "Found a new topic query peer {} in kbuckets of topic hash {}",
+                            node_id,
+                            topic_hash
+                        );
+                        new_query_contacts.push(node_contact);
+                    }
                 }
             }
         }
         // If no new nodes can be found to query, let topic lookup wait for new peers or time out.
-        if new_query_peers.is_empty() {
+        if new_query_contacts.is_empty() {
             debug!("Found no new peers to send TOPICQUERY to, setting query status to dry");
             if let Some(query) = self.active_topic_queries.queries.get_mut(&topic_hash) {
                 query.dry = true;
@@ -1075,13 +1207,12 @@ impl Service {
             return;
         }
 
-        trace!("Sending TOPICQUERYs to {} new peers", new_query_peers.len());
-        for enr in new_query_peers {
-            if let Ok(node_contact) = NodeContact::try_from_enr(enr.clone(), self.config.ip_mode)
-                .map_err(|e| error!("Failed to send TOPICQUERY to peer. Error: {:?}", e))
-            {
-                self.topic_query_request(node_contact, topic_hash);
-            }
+        trace!(
+            "Sending TOPICQUERYs to {} new peers",
+            new_query_contacts.len()
+        );
+        for node_contact in new_query_contacts {
+            self.topic_query_request(node_contact, topic_hash);
         }
     }
 
@@ -1179,7 +1310,7 @@ impl Service {
         }
         for kbuckets in self.topics_kbuckets.values_mut() {
             if let kbucket::Entry::Present(entry, _) = kbuckets.entry(&key) {
-                return Some(entry.value().clone());
+                return Some(entry.value().enr());
             }
         }
         // check the untrusted addresses for ongoing queries
@@ -2198,46 +2329,88 @@ impl Service {
             (self.config.table_filter)(enr)
         });
 
+        // Insert enr into enr bank if not present or update it if the enr is outdated.
+        /*for enr in enrs.iter() {
+            match self.enr_bank.entry(enr.node_id()) {
+                Entry::Occupied(mut entry) => {
+                    if entry.get().enr.enr.read().seq() < enr.seq() {
+                        *entry.get_mut().enr.enr.write() = enr.clone();
+                    }
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(EnrBankEntryAndStatus {
+                        enr: EnrBankEntry {
+                            enr: Arc::new(RwLock::new(enr.clone())),
+                        },
+                        status: Arc::new(RwLock::new(NodeStatus {
+                            state: ConnectionState::Disconnected,
+                            direction: ConnectionDirection::Incoming,
+                        })),
+                    });
+                }
+            }
+        }*/
+
         if let Some(topic_hash) = topic {
             let mut discovered_new_peer = false;
             if let Some(kbuckets_topic) = self.topics_kbuckets.get_mut(&topic_hash) {
+                // Insert found enrs into enr bank shared between all topics' kbuckets
                 for enr in enrs {
+                    match self.enr_bank.enr_bank.entry(enr.node_id()) {
+                        Entry::Occupied(mut entry) => {
+                            if entry.get().enr.enr.read().seq() < enr.seq() {
+                                *entry.get_mut().enr.enr.write() = enr.clone();
+                            }
+                        }
+                        Entry::Vacant(entry) => {
+                            entry.insert(EnrBankEntryAndStatus {
+                                enr: EnrBankEntry {
+                                    enr: Arc::new(RwLock::new(enr.clone())),
+                                },
+                                status: Arc::new(RwLock::new(NodeStatus {
+                                    state: ConnectionState::Disconnected,
+                                    direction: ConnectionDirection::Incoming,
+                                })),
+                            });
+                        }
+                    }
+
                     let key = kbucket::Key::from(enr.node_id());
+                    // The failure reasons calling kbuckets_topic.update_node(&key, enr.clone(), None)
+                    // instead won't be due to the table state, just filters or the key not existing
+                    // so the code captured in this new function is actually all the code necessary so
+                    // far since the table filter is currently passed as (None, None) to the topics'
+                    // kbuckets.
+                    kbuckets_topic.apply_pending_in_bucket_of(&key);
 
                     // If the ENR exists in the routing table and the discovered ENR has a greater
                     // sequence number, perform some filter checks before updating the enr.
 
-                    let must_update_enr = match kbuckets_topic.entry(&key) {
-                        kbucket::Entry::Present(entry, _) => entry.value().seq() < enr.seq(),
-                        kbucket::Entry::Pending(mut entry, _) => entry.value().seq() < enr.seq(),
-                        kbucket::Entry::Absent(_) => {
-                            trace!(
-                                "Discovered new peer {} for topic hash {}",
-                                enr.node_id(),
-                                topic_hash
-                            );
-                            let discovered_peers =
-                                self.discovered_peers_topic.entry(topic_hash).or_default();
-                            let node_id = enr.node_id();
-                            let peer_key: kbucket::Key<NodeId> = node_id.into();
-                            let topic_key: kbucket::Key<NodeId> =
-                                NodeId::new(&topic_hash.as_bytes()).into();
-                            if let Some(distance) = peer_key.log2_distance(&topic_key) {
-                                let bucket = discovered_peers.entry(distance).or_default();
-                                // If the intermediary storage before the topic's kbucktes is at bounds, discard the
-                                // uncontacted peers.
-                                if bucket.len() < MAX_UNCONTACTED_PEERS_TOPIC_BUCKET {
-                                    bucket.insert(node_id, enr.clone());
-                                    discovered_new_peer = true;
-                                } else {
-                                    warn!("Discarding uncontacted peers, uncontacted peers at bounds for topic hash {}", topic_hash);
-                                }
+                    if let kbucket::Entry::Absent(_) = kbuckets_topic.entry(&key) {
+                        trace!(
+                            "Discovered new peer {} for topic hash {}",
+                            enr.node_id(),
+                            topic_hash
+                        );
+                        let discovered_peers =
+                            self.discovered_peers_topic.entry(topic_hash).or_default();
+                        let node_id = enr.node_id();
+                        let peer_key: kbucket::Key<NodeId> = node_id.into();
+                        let topic_key: kbucket::Key<NodeId> =
+                            NodeId::new(&topic_hash.as_bytes()).into();
+                        if let Some(distance) = peer_key.log2_distance(&topic_key) {
+                            let bucket = discovered_peers.entry(distance).or_default();
+                            // If the intermediary storage before the topic's kbucktes is at bounds, discard the
+                            // uncontacted peers.
+                            if bucket.len() < MAX_UNCONTACTED_PEERS_TOPIC_BUCKET {
+                                bucket.insert(node_id);
+                                discovered_new_peer = true;
+                            } else {
+                                warn!("Discarding uncontacted peers, uncontacted peers at bounds for topic hash {}", topic_hash);
                             }
-                            false
                         }
-                        _ => false,
-                    };
-                    if must_update_enr {
+                    }
+                    /*if must_update_enr {
                         if let UpdateResult::Failed(reason) =
                             kbuckets_topic.update_node(&key, enr.clone(), None)
                         {
@@ -2250,7 +2423,7 @@ impl Service {
                             // If the enr was successfully updated, progress might be made in a topic lookup
                             discovered_new_peer = true;
                         }
-                    }
+                    }*/
                 }
                 if discovered_new_peer {
                     // If a topic lookup has dried up (no more peers to query), and we now have found new peers or updated enrs for
@@ -2341,8 +2514,30 @@ impl Service {
                     state: ConnectionState::Connected,
                     direction,
                 };
-                let insert_result = if let Some(kbuckets) = kbuckets_topic {
-                    kbuckets.insert_or_update(&key, enr, status)
+                let insert_result = if let Some(topic_hash) = topic_hash {
+                    if let Some(kbuckets) = self.topics_kbuckets.get_mut(&topic_hash) {
+                        let updated_enr = match self.enr_bank.enr_bank.entry(node_id) {
+                            Entry::Occupied(mut entry) => {
+                                let entry_mut = entry.get_mut();
+                                *entry_mut.enr.enr.write() = enr;
+                                *entry_mut.status.write() = status;
+                                entry.get().enr.clone()
+                            }
+                            Entry::Vacant(entry) => {
+                                let new_entry = entry.insert(EnrBankEntryAndStatus {
+                                    enr: EnrBankEntry {
+                                        enr: Arc::new(RwLock::new(enr)),
+                                    },
+                                    status: Arc::new(RwLock::new(status)),
+                                });
+                                new_entry.enr.clone()
+                            }
+                        };
+                        kbuckets.insert_or_update(&key, updated_enr, status)
+                    } else {
+                        debug_unreachable!("If a connection is being updated there should exist a set of topic's kbuckets for the topic");
+                        InsertResult::Failed(FailureReason::KeyNonExistant)
+                    }
                 } else {
                     self.kbuckets.write().insert_or_update(&key, enr, status)
                 };
@@ -2405,9 +2600,23 @@ impl Service {
                         debug!("Updated {:?}", update)
                     } // Updated ENR successfully.
                 }
+                match self.enr_bank.enr_bank.entry(node_id) {
+                    Entry::Occupied(mut entry) => {
+                        let entry_mut = entry.get_mut();
+                        *entry_mut.enr.enr.write() = enr;
+                        entry_mut.status.write().state = ConnectionState::Connected;
+                    }
+                    Entry::Vacant(_) => {
+                        debug_unreachable!("A PONG response was received from the node id {} which means it should already be stored in the enr bank.", node_id);
+                    }
+                }
+
+                // For now connection status is not a generic type in parity's kbuckets implementation we use,
+                // so connection status is yet not linked from enr bank to each topic's kbucktes.
                 for kbuckets in self.topics_kbuckets.values_mut() {
-                    match kbuckets.update_node(&key, enr.clone(), Some(ConnectionState::Connected))
-                    {
+                    let update_result =
+                        kbuckets.update_node_status(&key, ConnectionState::Connected, None);
+                    match update_result {
                         UpdateResult::Failed(FailureReason::KeyNonExistant) => {}
                         UpdateResult::Failed(reason) => {
                             self.peers_to_ping.remove(&node_id);
@@ -2639,7 +2848,7 @@ impl Service {
     /// returns the `Discv5Event::NodeInsertedTopics` variant if a new node has been inserted into
     /// the routing table.
     async fn bucket_maintenance_poll_topics(
-        kbuckets: impl Iterator<Item = (&TopicHash, &mut KBucketsTable<NodeId, Enr>)>,
+        kbuckets: impl Iterator<Item = (&TopicHash, &mut KBucketsTable<NodeId, EnrBankEntry>)>,
     ) -> Option<Discv5Event> {
         // Drain applied pending entries from the routing table.
         let mut update_kbuckets_futures = Vec::new();

@@ -104,6 +104,8 @@ async fn build_service(
             config.topic_query_timeout,
             config.max_nodes_response,
         ),
+        enr_bank: Default::default(),
+        discovered_enrs: Default::default(),
         exit,
         config,
     }

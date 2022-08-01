@@ -274,6 +274,16 @@ where
         }
     }
 
+    pub fn apply_pending_in_bucket_of(&mut self, key: &Key<TNodeId>) {
+        let index = BucketIndex::new(&self.local_key.distance(key));
+        if let Some(i) = index {
+            let bucket = &mut self.buckets[i.get()];
+            if let Some(applied) = bucket.apply_pending() {
+                self.applied_pending.push_back(applied)
+            }
+        }
+    }
+
     /// Updates a node's value if it exists in the table.
     ///
     /// Optionally the connection state can be modified.
@@ -521,6 +531,11 @@ where
     /// Returns an iterator over all the buckets in the routing table
     pub fn buckets_iter(&self) -> impl Iterator<Item = &KBucket<TNodeId, TVal>> {
         self.buckets.iter()
+    }
+
+    /// Returns an iterator over all the buckets in the routing table
+    pub fn buckets_iter_mut(&mut self) -> impl Iterator<Item = &mut KBucket<TNodeId, TVal>> {
+        self.buckets.iter_mut()
     }
 
     /// Returns an iterator over all the entries in the routing table to give to a table filter.

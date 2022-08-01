@@ -476,7 +476,7 @@ where
 
     /// Updates the value of the node referred to by the given key, if it is
     /// in the bucket. If the node is not in the bucket, or the update would violate a bucket
-    /// filter or incoming limits, returns false and removes the node from the bucket.
+    /// filter or incoming limits, returns [`UpdateResult::Failed`] and removes the node from the bucket.
     /// NOTE: This does not update the position of the node in the table. It node will be removed
     /// if it fails the filter however.
     pub fn update_value(&mut self, key: &Key<TNodeId>, value: TVal) -> UpdateResult {
