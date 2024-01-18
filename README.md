@@ -19,7 +19,7 @@ Status]][Crates Link]
 This is a rust implementation of the [Discovery v5](https://github.com/ethereum/devp2p/blob/master/discv5/discv5.md)
 peer discovery protocol.
 
-Discovery v5 is a protocol designed for encrypted peer discovery and topic advertisement. Each peer/node
+Discovery v5 is a protocol designed for encrypted peer discovery (and topic advertisement tba). Each peer/node
 on the network is identified via it's `ENR` ([Ethereum Node
 Record](https://eips.ethereum.org/EIPS/eip-778)), which is essentially a signed key-value store
 containing the node's public key and optionally IP address and port.
@@ -38,10 +38,8 @@ A simple example of creating this service is as follows:
 
 ```rust
    use discv5::{enr, enr::{CombinedKey, NodeId}, TokioExecutor, Discv5, Discv5ConfigBuilder};
+   use discv5::socket::ListenConfig;
    use std::net::SocketAddr;
-
-   // listening address and port
-   let listen_addr = "0.0.0.0:9000".parse::<SocketAddr>().unwrap();
 
    // construct a local ENR
    let enr_key = CombinedKey::generate_secp256k1();
@@ -54,8 +52,14 @@ A simple example of creating this service is as follows:
        .build()
        .unwrap();
 
+   // configuration for the sockets to listen on
+   let listen_config = ListenConfig::Ipv4 {
+       ip: Ipv4Addr::UNSPECIFIED,
+       port: 9000,
+   };
+
    // default configuration
-   let config = Discv5ConfigBuilder::new().build();
+   let config = Discv5ConfigBuilder::new(listen_config).build();
 
    // construct the discv5 server
    let mut discv5: Discv5 = Discv5::new(enr, enr_key, config).unwrap();
@@ -65,7 +69,7 @@ A simple example of creating this service is as follows:
    // discv5.add_enr(<ENR>)
 
    // start the discv5 server
-   runtime.block_on(discv5.start(listen_addr));
+   runtime.block_on(discv5.start());
 
    // run a find_node query
    runtime.block_on(async {
